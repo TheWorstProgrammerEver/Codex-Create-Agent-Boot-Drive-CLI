@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_IMAGE_URL = (
+    "https://downloads.raspberrypi.org/raspios_lite_arm64/images/"
+    "raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz"
+)
+DEFAULT_SHA256_URL = DEFAULT_IMAGE_URL + ".sha256"
+DEFAULT_CACHE_DIR = "~/.cache/codex-images/raspios-lite-arm64-2026-06-19"
+DEFAULT_SETUP_REPO = "https://github.com/TheWorstProgrammerEver/Codex-Agent-Setup.git"
+DEFAULT_SKILLS_REPO = "https://github.com/TheWorstProgrammerEver/codex-skills.git"
+
+
+class BootDriveError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DriveGuard:
+    expected_serial: str
+    expected_model: str
+    max_size_gb: float
+    allow_non_removable: bool
+
+
+@dataclass(frozen=True)
+class ImageConfig:
+    cache_dir: Path
+    url: str
+    sha256_url: str
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    setup_repo_url: str
+    setup_ref: str
+    skills_repo_url: str
+    skills_ref: str
+
+
+@dataclass(frozen=True)
+class FirstBootConfig:
+    ssh_password_auth: bool
+    enable_tty_autologin: bool
+    auto_run_setup: bool
+    codex_npm_package: str
+    clean_apt_cache: bool
+    disable_apt_daily: bool
+    disable_zram_writeback: bool
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    name: str
+    user: str
+    initial_password: str
+    wifi_ssid: str
+    wifi_psk: str
+    wifi_country: str
+    drive: DriveGuard
+    image: ImageConfig
+    repos: RepoConfig
+    first_boot: FirstBootConfig
+
+
+def run(cmd: list[str], *, input_text: str | None = None, capture: bool = False, dry_run: bool = False) -> subprocess.CompletedProcess[str]:
+    printable = " ".join(shlex.quote(part) for part in cmd)
+    print("+ " + printable)
+    if dry_run:
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    return subprocess.run(
+        cmd,
+        check=True,
+        text=True,
+        input=input_text,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def sudo_cmd(cmd: list[str]) -> list[str]:
+    if os.geteuid() == 0:
+        return cmd
+    return ["sudo", *cmd]
+
+
+def require_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        raise BootDriveError(f"Missing required command: {name}")
+
+
+def table(config: dict[str, Any], name: str) -> dict[str, Any]:
+    value = config.get(name, {})
+    if not isinstance(value, dict):
+        raise BootDriveError(f"[{name}] must be a table")
+    return value
+
+
+def required_string(values: dict[str, Any], key: str, label: str) -> str:
+    value = values.get(key)
+    if not isinstance(value, str) or not value:
+        raise BootDriveError(f"Missing required {label}: {key}")
+    return value
+
+
+def optional_string(values: dict[str, Any], key: str, default: str) -> str:
+    value = values.get(key, default)
+    if not isinstance(value, str):
+        raise BootDriveError(f"{key} must be a string")
+    return value
+
+
+def optional_bool(values: dict[str, Any], key: str, default: bool) -> bool:
+    value = values.get(key, default)
+    if not isinstance(value, bool):
+        raise BootDriveError(f"{key} must be true or false")
+    return value
+
+
+def optional_float(values: dict[str, Any], key: str, default: float) -> float:
+    value = values.get(key, default)
+    if not isinstance(value, (int, float)):
+        raise BootDriveError(f"{key} must be a number")
+    return float(value)
+
+
+def validate_name(value: str, label: str) -> str:
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", value):
+        raise BootDriveError(f"{label} must match [a-z][a-z0-9-]*: {value!r}")
+    return value
+
+
+def load_config(path: Path) -> AgentConfig:
+    data = tomllib.loads(path.read_text())
+    agent = table(data, "agent")
+    user = table(data, "user")
+    wifi = table(data, "wifi")
+    drive = table(data, "drive")
+    image = table(data, "image")
+    repos = table(data, "repositories")
+    first_boot = table(data, "first_boot")
+
+    name = validate_name(required_string(agent, "name", "[agent]"), "agent.name")
+    agent_user = validate_name(optional_string(agent, "user", name), "agent.user")
+
+    return AgentConfig(
+        name=name,
+        user=agent_user,
+        initial_password=required_string(user, "initial_password", "[user]"),
+        wifi_ssid=required_string(wifi, "ssid", "[wifi]"),
+        wifi_psk=required_string(wifi, "psk", "[wifi]"),
+        wifi_country=optional_string(wifi, "country", "AU"),
+        drive=DriveGuard(
+            expected_serial=optional_string(drive, "expected_serial", ""),
+            expected_model=optional_string(drive, "expected_model", ""),
+            max_size_gb=optional_float(drive, "max_size_gb", 64.0),
+            allow_non_removable=optional_bool(drive, "allow_non_removable", False),
+        ),
+        image=ImageConfig(
+            cache_dir=Path(optional_string(image, "cache_dir", DEFAULT_CACHE_DIR)).expanduser(),
+            url=optional_string(image, "url", DEFAULT_IMAGE_URL),
+            sha256_url=optional_string(image, "sha256_url", DEFAULT_SHA256_URL),
+        ),
+        repos=RepoConfig(
+            setup_repo_url=optional_string(repos, "setup_repo_url", DEFAULT_SETUP_REPO),
+            setup_ref=optional_string(repos, "setup_ref", "main"),
+            skills_repo_url=optional_string(repos, "skills_repo_url", DEFAULT_SKILLS_REPO),
+            skills_ref=optional_string(repos, "skills_ref", "main"),
+        ),
+        first_boot=FirstBootConfig(
+            ssh_password_auth=optional_bool(first_boot, "ssh_password_auth", True),
+            enable_tty_autologin=optional_bool(first_boot, "enable_tty_autologin", True),
+            auto_run_setup=optional_bool(first_boot, "auto_run_setup", True),
+            codex_npm_package=optional_string(first_boot, "codex_npm_package", "@openai/codex"),
+            clean_apt_cache=optional_bool(first_boot, "clean_apt_cache", True),
+            disable_apt_daily=optional_bool(first_boot, "disable_apt_daily", False),
+            disable_zram_writeback=optional_bool(first_boot, "disable_zram_writeback", False),
+        ),
+    )
+
+
+def lsblk_json(path: str, columns: list[str]) -> dict[str, Any]:
+    result = run(["lsblk", "--json", "--bytes", "-o", ",".join(columns), path], capture=True)
+    return json.loads(result.stdout)
+
+
+def resolve_device(path: str) -> str:
+    resolved = os.path.realpath(path)
+    if not Path(resolved).exists():
+        raise BootDriveError(f"Destination does not exist: {path}")
+    return resolved
+
+
+def drive_info(destination: str) -> dict[str, Any]:
+    data = lsblk_json(destination, ["NAME", "PATH", "TYPE", "TRAN", "RM", "SIZE", "VENDOR", "MODEL", "SERIAL", "MOUNTPOINTS"])
+    devices = data.get("blockdevices", [])
+    if len(devices) != 1:
+        raise BootDriveError(f"Could not inspect destination: {destination}")
+    return devices[0]
+
+
+def mounted_descendants(info: dict[str, Any]) -> list[str]:
+    mounted: list[str] = []
+
+    def visit(node: dict[str, Any]) -> None:
+        mountpoints = node.get("mountpoints") or []
+        if any(mountpoints):
+            mounted.append(node.get("path") or ("/dev/" + node.get("name", "")))
+        for child in node.get("children") or []:
+            visit(child)
+
+    visit(info)
+    return mounted
+
+
+def validate_drive(destination: str, config: AgentConfig) -> dict[str, Any]:
+    info = drive_info(destination)
+    if info.get("type") != "disk":
+        raise BootDriveError(f"Destination must be a whole disk, got type={info.get('type')}: {destination}")
+    if not config.drive.allow_non_removable and not bool(info.get("rm")):
+        raise BootDriveError("Destination is not marked removable. Set drive.allow_non_removable=true only if this is intentional.")
+
+    serial = str(info.get("serial") or "")
+    model = str(info.get("model") or "").strip()
+    size = int(info.get("size") or 0)
+    max_bytes = int(config.drive.max_size_gb * 1024 * 1024 * 1024)
+
+    if config.drive.expected_serial and serial != config.drive.expected_serial:
+        raise BootDriveError(f"Drive serial mismatch: expected {config.drive.expected_serial}, got {serial}")
+    if config.drive.expected_model and config.drive.expected_model not in model:
+        raise BootDriveError(f"Drive model mismatch: expected substring {config.drive.expected_model!r}, got {model!r}")
+    if size > max_bytes:
+        raise BootDriveError(f"Drive size {size} exceeds configured max_size_gb={config.drive.max_size_gb}")
+    return info
+
+
+def download_if_needed(url: str, target: Path, dry_run: bool) -> None:
+    if target.exists() and target.stat().st_size > 0:
+        print(f"Using cached {target}")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run(["curl", "--fail", "--location", "--show-error", "--output", str(target), url], dry_run=dry_run)
+
+
+def verify_sha256(image_path: Path, sha_path: Path, dry_run: bool) -> None:
+    if dry_run:
+        print(f"DRY would verify SHA256 for {image_path}")
+        return
+    expected = sha_path.read_text().split()[0]
+    actual = run(["sha256sum", str(image_path)], capture=True).stdout.split()[0]
+    if actual != expected:
+        raise BootDriveError(f"SHA256 mismatch for {image_path}: expected {expected}, got {actual}")
+    print(f"SHA256 OK: {image_path.name}")
+
+
+def image_paths(config: AgentConfig, dry_run: bool) -> tuple[Path, Path]:
+    cache = config.image.cache_dir
+    cache.mkdir(parents=True, exist_ok=True)
+    image_path = cache / Path(config.image.url).name
+    sha_path = cache / Path(config.image.sha256_url).name
+    download_if_needed(config.image.url, image_path, dry_run)
+    download_if_needed(config.image.sha256_url, sha_path, dry_run)
+    verify_sha256(image_path, sha_path, dry_run)
+    return image_path, sha_path
+
+
+def uncompressed_size(image_path: Path) -> int:
+    output = run(["xz", "--robot", "--list", str(image_path)], capture=True).stdout
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0] == "totals":
+            return int(parts[4])
+    raise BootDriveError(f"Could not determine uncompressed image size: {image_path}")
+
+
+def unmount_existing(info: dict[str, Any], dry_run: bool) -> None:
+    for path in reversed(mounted_descendants(info)):
+        run(sudo_cmd(["umount", path]), dry_run=dry_run)
+
+
+def write_image(image_path: Path, destination: str, image_size: int, dry_run: bool, skip_compare: bool) -> None:
+    if dry_run:
+        print(f"DRY would xzcat {image_path} to {destination} and sync")
+        return
+    shell = f"xzcat {shlex.quote(str(image_path))} | dd of={shlex.quote(destination)} bs=4M conv=fsync status=progress"
+    run(sudo_cmd(["bash", "-c", shell]))
+    run(["sync"])
+    if not skip_compare:
+        compare = f"xzcat {shlex.quote(str(image_path))} | cmp -n {image_size} - {shlex.quote(destination)}"
+        run(sudo_cmd(["bash", "-c", compare]))
+        print("Byte compare OK")
+    run(sudo_cmd(["partprobe", destination]))
+    run(["udevadm", "settle"])
+
+
+def child_partitions_once(destination: str) -> tuple[str, str] | None:
+    data = lsblk_json(destination, ["NAME", "PATH", "TYPE", "FSTYPE", "LABEL"])
+    devices = data["blockdevices"]
+    children = devices[0].get("children") or []
+    boot = ""
+    root = ""
+    for index, child in enumerate(children):
+        label = child.get("label")
+        fstype = child.get("fstype")
+        path = child.get("path")
+        if label == "bootfs" or (index == 0 and fstype == "vfat"):
+            boot = path
+        if label == "rootfs" or (index == 1 and fstype == "ext4"):
+            root = path
+    if not boot or not root:
+        return None
+    return boot, root
+
+
+def child_partitions(destination: str, *, timeout_seconds: int = 20) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while True:
+        try:
+            partitions = child_partitions_once(destination)
+            if partitions:
+                return partitions
+        except subprocess.CalledProcessError as exc:
+            last_error = str(exc)
+        if time.monotonic() >= deadline:
+            detail = f": {last_error}" if last_error else ""
+            raise BootDriveError(f"Could not find boot/root partitions under {destination}{detail}")
+        run(["udevadm", "settle"])
+        time.sleep(1)
+
+
+def sudo_write(path: Path, content: str, mode: str = "0644", dry_run: bool = False) -> None:
+    print(f"write {path}")
+    if dry_run:
+        return
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    try:
+        run(sudo_cmd(["install", "-D", "-m", mode, tmp_path, str(path)]))
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def sudo_touch(path: Path, dry_run: bool = False) -> None:
+    print(f"touch {path}")
+    if not dry_run:
+        run(sudo_cmd(["install", "-D", "-m", "0644", "/dev/null", str(path)]))
+
+
+def sudo_symlink(target: str, link: Path, dry_run: bool = False) -> None:
+    print(f"symlink {link} -> {target}")
+    if not dry_run:
+        run(sudo_cmd(["mkdir", "-p", str(link.parent)]))
+        run(sudo_cmd(["ln", "-sfn", target, str(link)]))
+
+
+def shell_value(value: str) -> str:
+    return shlex.quote(value)
+
+
+def bool01(value: bool) -> str:
+    return "1" if value else "0"
+
+
+def yaml_double(value: str) -> str:
+    return json.dumps(value)
+
+
+def password_hash(password: str, dry_run: bool) -> str:
+    if dry_run:
+        return "$6$dry-run-salt$dry-run-placeholder"
+    return run(["openssl", "passwd", "-6", "-stdin"], input_text=password + "\n", capture=True).stdout.strip()
+
+
+def render_codex_agent_env(config: AgentConfig) -> str:
+    fb = config.first_boot
+    repos = config.repos
+    values = {
+        "AGENT_NAME": config.name,
+        "AGENT_USER": config.user,
+        "SSH_PASSWORD_AUTH": "yes" if fb.ssh_password_auth else "no",
+        "ENABLE_TTY_AUTOLOGIN": bool01(fb.enable_tty_autologin),
+        "AUTO_RUN_AGENT_SETUP": bool01(fb.auto_run_setup),
+        "SETUP_REPO_URL": repos.setup_repo_url,
+        "SETUP_REF": repos.setup_ref,
+        "SETUP_DIR": "/opt/codex-agent-setup",
+        "SKILLS_REPO_URL": repos.skills_repo_url,
+        "SKILLS_REF": repos.skills_ref,
+        "CODEX_NPM_PACKAGE": fb.codex_npm_package,
+        "CLEAN_APT_CACHE": bool01(fb.clean_apt_cache),
+        "DISABLE_APT_DAILY": bool01(fb.disable_apt_daily),
+        "DISABLE_ZRAM_WRITEBACK": bool01(fb.disable_zram_writeback),
+    }
+    lines = ["# Codex agent first-boot configuration. Generated by create-agent-boot-drive.\n"]
+    for key, value in values.items():
+        lines.append(f"{key}={shell_value(value)}\n")
+    return "".join(lines)
+
+
+def render_network_config(config: AgentConfig) -> str:
+    return textwrap.dedent(
+        f"""\
+        network:
+          version: 2
+          renderer: NetworkManager
+          wifis:
+            wlan0:
+              dhcp4: true
+              optional: false
+              access-points:
+                {yaml_double(config.wifi_ssid)}:
+                  password: {yaml_double(config.wifi_psk)}
+              regulatory-domain: {yaml_double(config.wifi_country)}
+        """
+    )
+
+
+def render_firstboot_service() -> str:
+    return textwrap.dedent(
+        """\
+        [Unit]
+        Description=Codex first boot provisioning
+        After=userconfig.service sshswitch.service
+        Wants=sshswitch.service
+        ConditionPathExists=/boot/firmware/codex-agent.env
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/codex-firstboot.sh
+
+        [Install]
+        WantedBy=multi-user.target
+        """
+    )
+
+
+def render_setup_service() -> str:
+    return textwrap.dedent(
+        """\
+        [Unit]
+        Description=Codex automatic agent setup
+        After=network-online.target codex-firstboot.service
+        Wants=network-online.target
+        StartLimitIntervalSec=30min
+        StartLimitBurst=4
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/codex-agent-setup-install.sh
+        TimeoutStartSec=0
+        Restart=on-failure
+        RestartSec=60
+
+        [Install]
+        WantedBy=multi-user.target
+        """
+    )
+
+
+def render_firstboot_script() -> str:
+    return r"""#!/usr/bin/env bash
+set -euo pipefail
+
+log_path="/var/log/codex-firstboot.log"
+exec > >(tee -a "$log_path") 2>&1
+
+echo "== Codex first boot provisioning =="
+date -Is
+
+get_fwloc() {
+  if command -v /usr/lib/raspberrypi-sys-mods/get_fw_loc >/dev/null 2>&1; then
+    /usr/lib/raspberrypi-sys-mods/get_fw_loc 2>/dev/null && return
+  fi
+  if mountpoint -q /boot/firmware; then
+    printf '/boot/firmware\n'
+    return
+  fi
+  printf '/boot\n'
+}
+
+fwloc="${CODEX_AGENT_FWLOC:-$(get_fwloc)}"
+config_path="$fwloc/codex-agent.env"
+
+if [[ -f "$config_path" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$config_path"
+  set +a
+fi
+
+agent_name="${AGENT_NAME:-agent}"
+agent_user="${AGENT_USER:-$agent_name}"
+ssh_password_auth="${SSH_PASSWORD_AUTH:-yes}"
+enable_tty_autologin="${ENABLE_TTY_AUTOLOGIN:-1}"
+auto_run_setup="${AUTO_RUN_AGENT_SETUP:-1}"
+
+if [[ ! "$agent_name" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "Invalid AGENT_NAME: $agent_name" >&2
+  exit 2
+fi
+
+if [[ ! "$agent_user" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "Invalid AGENT_USER: $agent_user" >&2
+  exit 2
+fi
+
+case "$ssh_password_auth" in
+  yes|no) ;;
+  *) echo "SSH_PASSWORD_AUTH must be yes or no; got $ssh_password_auth" >&2; exit 2 ;;
+esac
+
+printf '%s\n' "$agent_name" > /etc/hostname
+if grep -q '^127[.]0[.]1[.]1' /etc/hosts; then
+  sed -i "s/^127[.]0[.]1[.]1.*/127.0.1.1\t${agent_name}/" /etc/hosts
+else
+  printf '127.0.1.1\t%s\n' "$agent_name" >> /etc/hosts
+fi
+
+if ! id "$agent_user" >/dev/null 2>&1; then
+  echo "Expected user '$agent_user' does not exist yet. userconfig.service may have failed." >&2
+  exit 1
+fi
+
+home_dir="$(getent passwd "$agent_user" | cut -d: -f6)"
+
+mkdir -p /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/99-codex-initial.conf <<EOF
+# Codex-managed initial SSH defaults for this dedicated generated image.
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication ${ssh_password_auth}
+KbdInteractiveAuthentication no
+AllowUsers ${agent_user}
+EOF
+
+cat >/etc/sudoers.d/90-codex-agent <<EOF
+${agent_user} ALL=(ALL) NOPASSWD:ALL
+EOF
+chmod 0440 /etc/sudoers.d/90-codex-agent
+visudo -cf /etc/sudoers.d/90-codex-agent
+
+if [[ "$enable_tty_autologin" == "1" ]]; then
+  mkdir -p /etc/systemd/system/getty@tty1.service.d
+  cat >/etc/systemd/system/getty@tty1.service.d/autologin.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin ${agent_user} --noclear %I \$TERM
+EOF
+fi
+
+cat >"$home_dir/AGENTS.md" <<EOF
+# Codex Home Notes
+
+- This is a parameterized Raspberry Pi OS boot image for a dedicated Codex-managed host.
+- At the start of work, check \`CODEX_TODO.md\`, \`REMOTE_ACCESS.md\`, \`/boot/firmware/codex-agent.env\`, and \`/var/log/codex-agent-health-summary.log\`.
+- Keep credentials scoped and revocable. Do not store private keys, tokens, passwords, or recovery codes in notes.
+EOF
+
+cat >"$home_dir/CODEX_TODO.md" <<EOF
+# Codex TODO
+
+## Active
+
+- Confirm this USB boot reaches the network as \`${agent_name}.local\`.
+- SSH in with: \`ssh ${agent_user}@${agent_name}.local\`.
+- Check setup health: \`sudo cat /var/log/codex-agent-health-summary.log\`.
+- Check setup log if needed: \`sudo less /var/log/codex-agent-setup.log\`.
+- Complete manual Codex auth: \`codex login --device-auth\`.
+- Start a fresh Codex session after auth so prewritten permissions take effect: \`codex-attach\`.
+- After key-based SSH login is confirmed, disable password auth with the SSH bootstrap skill.
+
+## Notes
+
+- Initial SSH password authentication is intentionally enabled for generic first access unless this image was configured otherwise.
+- No private GitHub App key, GitHub token, private SSH key, Codex auth, Wi-Fi secret, or plaintext password should be recorded in durable notes.
+- Codex config is written before auth; Codex auth itself remains manual.
+EOF
+
+chown "$agent_user:$agent_user" "$home_dir/AGENTS.md" "$home_dir/CODEX_TODO.md"
+chmod 0644 "$home_dir/AGENTS.md" "$home_dir/CODEX_TODO.md"
+
+systemctl daemon-reload || true
+systemctl enable ssh.service || true
+
+if [[ "$auto_run_setup" == "1" ]]; then
+  systemctl enable codex-agent-setup.service || true
+fi
+
+systemctl disable codex-firstboot.service || true
+rm -f /etc/systemd/system/multi-user.target.wants/codex-firstboot.service
+
+echo "Codex first boot provisioning complete."
+date -Is
+"""
+
+
+def render_setup_script() -> str:
+    return r"""#!/usr/bin/env bash
+set -euo pipefail
+
+log_path="/var/log/codex-agent-setup.log"
+health_path="/var/log/codex-agent-health-summary.log"
+exec > >(tee -a "$log_path") 2>&1
+
+echo "== Codex automatic agent setup =="
+date -Is
+
+get_fwloc() {
+  if command -v /usr/lib/raspberrypi-sys-mods/get_fw_loc >/dev/null 2>&1; then
+    /usr/lib/raspberrypi-sys-mods/get_fw_loc 2>/dev/null && return
+  fi
+  if mountpoint -q /boot/firmware; then
+    printf '/boot/firmware\n'
+    return
+  fi
+  printf '/boot\n'
+}
+
+fwloc="${CODEX_AGENT_FWLOC:-$(get_fwloc)}"
+config_path="$fwloc/codex-agent.env"
+
+if [[ -f "$config_path" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$config_path"
+  set +a
+fi
+
+agent_name="${AGENT_NAME:-agent}"
+agent_user="${AGENT_USER:-$agent_name}"
+setup_repo_url="${SETUP_REPO_URL:-https://github.com/TheWorstProgrammerEver/Codex-Agent-Setup.git}"
+setup_ref="${SETUP_REF:-main}"
+setup_dir="${SETUP_DIR:-/opt/codex-agent-setup}"
+skills_repo_url="${SKILLS_REPO_URL:-https://github.com/TheWorstProgrammerEver/codex-skills.git}"
+skills_ref="${SKILLS_REF:-main}"
+codex_npm_package="${CODEX_NPM_PACKAGE:-@openai/codex}"
+clean_apt_cache="${CLEAN_APT_CACHE:-1}"
+disable_apt_daily="${DISABLE_APT_DAILY:-0}"
+disable_zram_writeback="${DISABLE_ZRAM_WRITEBACK:-0}"
+
+if ! id "$agent_user" >/dev/null 2>&1; then
+  echo "Expected user '$agent_user' does not exist." >&2
+  exit 1
+fi
+
+home_dir="$(getent passwd "$agent_user" | cut -d: -f6)"
+export DEBIAN_FRONTEND=noninteractive
+
+packages=(
+  git
+  nodejs
+  npm
+  python3
+  sudo
+  openssh-server
+  tmux
+  avahi-daemon
+  bubblewrap
+  curl
+  ca-certificates
+)
+
+apt-get update
+apt-get install -y --no-install-recommends "${packages[@]}"
+systemctl enable --now ssh.service >/dev/null 2>&1 || systemctl enable --now sshd.service >/dev/null 2>&1 || true
+systemctl enable --now avahi-daemon.service >/dev/null 2>&1 || true
+
+if [[ "$disable_apt_daily" == "1" ]]; then
+  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer || true
+fi
+
+if [[ "$disable_zram_writeback" == "1" ]]; then
+  systemctl disable --now rpi-zram-writeback.timer || true
+fi
+
+npm install -g "$codex_npm_package"
+
+if [[ -d "$setup_dir/.git" ]]; then
+  git -C "$setup_dir" fetch --prune origin
+  git -C "$setup_dir" checkout "$setup_ref"
+  if [[ "$setup_ref" == "main" ]]; then
+    git -C "$setup_dir" pull --ff-only origin main
+  fi
+elif [[ -e "$setup_dir" ]]; then
+  echo "Refusing to replace existing non-git setup path: $setup_dir" >&2
+  exit 1
+else
+  mkdir -p "$(dirname "$setup_dir")"
+  git clone "$setup_repo_url" "$setup_dir"
+  git -C "$setup_dir" checkout "$setup_ref"
+fi
+chown -R "$agent_user:$agent_user" "$setup_dir"
+
+user_setup="$(mktemp)"
+cat >"$user_setup" <<'USER_SETUP'
+#!/usr/bin/env bash
+set -euo pipefail
+
+skills_dir="${AGENT_BOOTSTRAP_SKILLS_DIR:-$HOME/agent-bootstrap-skills}"
+target="${SKILLS_INSTALL_TARGET:-$HOME/.codex/skills}"
+
+if [[ -d "$skills_dir/.git" ]]; then
+  git -C "$skills_dir" fetch --prune origin
+elif [[ -e "$skills_dir" ]]; then
+  printf 'Refusing to replace existing non-git skills path: %s\n' "$skills_dir" >&2
+  exit 1
+else
+  git clone "$SKILLS_REPO_URL" "$skills_dir"
+fi
+
+if [[ -n "${SKILLS_REF:-}" ]]; then
+  git -C "$skills_dir" checkout "$SKILLS_REF"
+else
+  git -C "$skills_dir" checkout main
+  git -C "$skills_dir" pull --ff-only origin main
+fi
+
+npm --prefix "$skills_dir" run install:skills -- --target "$target" \
+  agent-bootstrap-yolo-permissions \
+  agent-bootstrap-ssh \
+  manage-durable-notes
+USER_SETUP
+chmod 0755 "$user_setup"
+
+runuser -u "$agent_user" -- env \
+  SKILLS_REPO_URL="$skills_repo_url" \
+  SKILLS_REF="$skills_ref" \
+  AGENT_BOOTSTRAP_SKILLS_DIR="$home_dir/agent-bootstrap-skills" \
+  SKILLS_INSTALL_TARGET="$home_dir/.codex/skills" \
+  bash "$user_setup"
+rm -f "$user_setup"
+
+runuser -u "$agent_user" -- python3 "$home_dir/.codex/skills/manage-durable-notes/scripts/init_durable_notes.py" --home "$home_dir"
+runuser -u "$agent_user" -- python3 "$home_dir/.codex/skills/agent-bootstrap-yolo-permissions/scripts/bootstrap_yolo_permissions.py" \
+  --home "$home_dir" \
+  --workspace "$home_dir" \
+  --dedicated-host \
+  --enable-passwordless-sudo \
+  --yes
+runuser -u "$agent_user" -- python3 "$home_dir/.codex/skills/agent-bootstrap-ssh/scripts/bootstrap_ssh.py" \
+  --user "$agent_user" \
+  --home "$home_dir" \
+  --enable-password-auth \
+  --enable-passwordless-sudo \
+  --yes
+
+if [[ "$clean_apt_cache" == "1" ]]; then
+  apt-get clean
+fi
+
+failures=0
+check() {
+  local label="$1"
+  shift
+  if "$@"; then
+    printf 'PASS %s\n' "$label"
+  else
+    printf 'FAIL %s\n' "$label"
+    failures=$((failures + 1))
+  fi
+}
+
+check_agent() {
+  local label="$1"
+  shift
+  if runuser -u "$agent_user" -- "$@"; then
+    printf 'PASS %s\n' "$label"
+  else
+    printf 'FAIL %s\n' "$label"
+    failures=$((failures + 1))
+  fi
+}
+
+check_sshd() {
+  local label="$1"
+  local pattern="$2"
+  if printf '%s\n' "$sshd_effective" | grep -Eq "$pattern"; then
+    printf 'PASS %s\n' "$label"
+  else
+    printf 'FAIL %s\n' "$label"
+    failures=$((failures + 1))
+  fi
+}
+
+{
+  echo "== Codex agent setup health =="
+  date -Is
+  echo "agent_name=$agent_name"
+  echo "agent_user=$agent_user"
+
+  check "codex-version" codex --version
+  check "ssh-active" systemctl is-active --quiet ssh.service
+  check "avahi-active" systemctl is-active --quiet avahi-daemon.service
+  check_agent "passwordless-sudo" sudo -n true
+  check "remote-access-note" test -f "$home_dir/REMOTE_ACCESS.md"
+  check "durable-notes-index" test -f "$home_dir/codex-notes/INDEX.md"
+  check "yolo-skill-installed" test -f "$home_dir/.codex/skills/agent-bootstrap-yolo-permissions/SKILL.md"
+  check "ssh-skill-installed" test -f "$home_dir/.codex/skills/agent-bootstrap-ssh/SKILL.md"
+  check "notes-skill-installed" test -f "$home_dir/.codex/skills/manage-durable-notes/SKILL.md"
+  check "codex-config-exists" test -f "$home_dir/.codex/config.toml"
+  check "codex-config-sandbox" grep -q '^sandbox_mode = "danger-full-access"' "$home_dir/.codex/config.toml"
+  check "codex-config-approval" grep -q '^approval_policy = "never"' "$home_dir/.codex/config.toml"
+  check "codex-config-web-search" grep -q '^web_search = "live"' "$home_dir/.codex/config.toml"
+  check "codex-config-trusted-home" grep -q 'trust_level = "trusted"' "$home_dir/.codex/config.toml"
+
+  sshd_effective="$(sshd -T 2>/dev/null || true)"
+  check_sshd "sshd-permit-root-no" '^permitrootlogin no$'
+  check_sshd "sshd-pubkey-yes" '^pubkeyauthentication yes$'
+  check_sshd "sshd-password-configured" '^passwordauthentication '
+  check_sshd "sshd-allow-user" "^allowusers( .*)? ${agent_user}( .*)?$"
+
+  if [[ "$failures" -eq 0 ]]; then
+    echo "overall=PASS"
+  else
+    echo "overall=FAIL failures=$failures"
+  fi
+} | tee "$health_path"
+
+if [[ "$failures" -ne 0 ]]; then
+  echo "One or more setup health assertions failed. Leaving codex-agent-setup.service enabled for retry/inspection." >&2
+  exit 1
+fi
+
+systemctl disable codex-agent-setup.service || true
+rm -f /etc/systemd/system/multi-user.target.wants/codex-agent-setup.service
+
+echo "Codex automatic agent setup complete."
+echo "Installed Codex package: $codex_npm_package"
+date -Is
+"""
+
+
+def render_readme(config: AgentConfig) -> str:
+    return textwrap.dedent(
+        f"""\
+        # Codex Agent Boot Drive
+
+        This drive was generated for `{config.name}`.
+
+        ## First Access
+
+        ```bash
+        ssh {config.user}@{config.name}.local
+        ```
+
+        Then inspect:
+
+        ```bash
+        cat ~/CODEX_TODO.md
+        sudo cat /var/log/codex-agent-health-summary.log
+        sudo less /var/log/codex-agent-setup.log
+        ```
+
+        Codex authentication is intentionally not embedded. Complete it manually:
+
+        ```bash
+        codex login --device-auth
+        ```
+
+        Start a new Codex session after auth so the prewritten config takes effect:
+
+        ```bash
+        codex-attach
+        ```
+
+        Do not store private keys, tokens, passwords, recovery codes, Wi-Fi secrets, or Codex auth files in durable notes.
+        """
+    )
+
+
+def customize_image(destination: str, config: AgentConfig, dry_run: bool) -> None:
+    boot_part, root_part = child_partitions(destination)
+    with tempfile.TemporaryDirectory(prefix="codex-agent-boot-drive-") as tmp:
+        base = Path(tmp)
+        boot_mount = base / "boot"
+        root_mount = base / "root"
+        boot_mount.mkdir()
+        root_mount.mkdir()
+        try:
+            run(sudo_cmd(["mount", boot_part, str(boot_mount)]), dry_run=dry_run)
+            run(sudo_cmd(["mount", root_part, str(root_mount)]), dry_run=dry_run)
+
+            user_hash = password_hash(config.initial_password, dry_run)
+            sudo_write(boot_mount / "userconf", f"{config.user}:{user_hash}\n", "0600", dry_run)
+            sudo_touch(boot_mount / "ssh", dry_run)
+            sudo_write(boot_mount / "codex-agent.env", render_codex_agent_env(config), "0644", dry_run)
+            sudo_write(boot_mount / "network-config", render_network_config(config), "0600", dry_run)
+            sudo_write(boot_mount / "README-CODEX-BOOTSTRAP.md", render_readme(config), "0644", dry_run)
+
+            sudo_write(root_mount / "usr/local/sbin/codex-firstboot.sh", render_firstboot_script(), "0755", dry_run)
+            sudo_write(root_mount / "usr/local/sbin/codex-agent-setup-install.sh", render_setup_script(), "0755", dry_run)
+            sudo_write(root_mount / "etc/systemd/system/codex-firstboot.service", render_firstboot_service(), "0644", dry_run)
+            sudo_write(root_mount / "etc/systemd/system/codex-agent-setup.service", render_setup_service(), "0644", dry_run)
+            sudo_symlink("../codex-firstboot.service", root_mount / "etc/systemd/system/multi-user.target.wants/codex-firstboot.service", dry_run)
+        finally:
+            run(["sync"], dry_run=dry_run)
+            run(sudo_cmd(["umount", str(root_mount)]), dry_run=dry_run)
+            run(sudo_cmd(["umount", str(boot_mount)]), dry_run=dry_run)
+
+    run(sudo_cmd(["fsck.vfat", "-n", boot_part]), dry_run=dry_run)
+    run(sudo_cmd(["e2fsck", "-fn", root_part]), dry_run=dry_run)
+
+
+def print_plan(destination: str, info: dict[str, Any], config: AgentConfig) -> None:
+    print("== Plan ==")
+    print(f"destination: {destination}")
+    print(f"drive: {info.get('vendor', '')} {info.get('model', '')} serial={info.get('serial', '')} size={info.get('size', '')}")
+    print(f"agent: {config.user}@{config.name}.local")
+    print(f"wifi: SSID configured from local config; PSK will not be printed")
+    print(f"image: {config.image.url}")
+    print(f"setup repo: {config.repos.setup_repo_url}@{config.repos.setup_ref}")
+    print(f"skills repo: {config.repos.skills_repo_url}@{config.repos.skills_ref}")
+    print("")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Create a Raspberry Pi Codex agent USB boot drive.")
+    parser.add_argument("--destination", required=True, help="Whole-disk destination, preferably /dev/disk/by-id/...")
+    parser.add_argument("--config", required=True, help="Local TOML config containing agent, Wi-Fi, and drive guardrails.")
+    parser.add_argument("--yes", action="store_true", help="Acknowledge destructive write to --destination.")
+    parser.add_argument("--dry-run", action="store_true", help="Validate config and print the plan without writing.")
+    parser.add_argument("--skip-byte-compare", action="store_true", help="Skip full byte compare after image write.")
+    parser.add_argument("--customize-existing", action="store_true", help="Skip image write and customize existing bootfs/rootfs partitions.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        for tool in ("curl", "sha256sum", "xz", "xzcat", "lsblk", "dd", "cmp", "partprobe", "udevadm", "mount", "umount", "fsck.vfat", "e2fsck", "openssl"):
+            require_tool(tool)
+
+        config = load_config(Path(args.config).expanduser())
+        destination = resolve_device(args.destination)
+        info = validate_drive(destination, config)
+        print_plan(destination, info, config)
+
+        if not args.yes and not args.dry_run:
+            raise BootDriveError("Refusing destructive write without --yes")
+
+        if args.customize_existing:
+            print("Skipping image write; customizing existing bootfs/rootfs partitions.")
+        else:
+            image_path, _ = image_paths(config, args.dry_run)
+            image_size = uncompressed_size(image_path) if not args.dry_run else 0
+            unmount_existing(info, args.dry_run)
+            write_image(image_path, destination, image_size, args.dry_run, args.skip_byte_compare)
+            if args.dry_run:
+                print("DRY would mount generated boot/root partitions, inject first-boot files, run fsck, and unmount.")
+                print("Boot drive dry-run complete.")
+                return 0
+        customize_image(destination, config, args.dry_run)
+
+        if args.dry_run:
+            print("Boot drive dry-run complete.")
+        else:
+            print("Boot drive creation complete.")
+            print(f"First SSH target: {config.user}@{config.name}.local")
+        return 0
+    except (BootDriveError, subprocess.CalledProcessError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

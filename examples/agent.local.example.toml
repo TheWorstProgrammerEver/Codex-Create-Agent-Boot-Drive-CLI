@@ -1,0 +1,42 @@
+# Copy to ./agent.local.toml or ./rubick.local.toml.
+# Keep the copied file local and mode 0600. It contains secrets.
+
+[agent]
+name = "rubick"
+user = "rubick"
+
+[user]
+initial_password = "replace-with-a-temporary-password"
+
+[wifi]
+ssid = "replace-with-ssid"
+psk = "replace-with-wifi-password"
+country = "AU"
+
+[drive]
+# Prefer /dev/disk/by-id on the command line, then add guardrails here.
+expected_serial = "replace-with-usb-serial"
+expected_model = "Cruzer Blade"
+max_size_gb = 64
+allow_non_removable = false
+
+[image]
+cache_dir = "~/.cache/codex-images/raspios-lite-arm64-2026-06-19"
+url = "https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz"
+sha256_url = "https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz.sha256"
+
+[repositories]
+setup_repo_url = "https://github.com/TheWorstProgrammerEver/Codex-Agent-Setup.git"
+setup_ref = "main"
+skills_repo_url = "https://github.com/TheWorstProgrammerEver/codex-skills.git"
+skills_ref = "main"
+
+[first_boot]
+ssh_password_auth = true
+enable_tty_autologin = true
+auto_run_setup = true
+codex_npm_package = "@openai/codex"
+clean_apt_cache = true
+disable_apt_daily = false
+disable_zram_writeback = false
+
