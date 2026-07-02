@@ -1,9 +1,11 @@
-# Copy to ./agent.local.toml or ./rubick.local.toml.
+# Copy to ./agent.local.toml.
 # Keep the copied file local and mode 0600. It contains secrets.
 
 [agent]
-name = "rubick"
-user = "rubick"
+# Durable agent identity and generated .local hostname.
+name = "my-agent"
+# Local Unix account used for SSH and first-boot setup.
+user = "my-user"
 
 [user]
 initial_password = "replace-with-a-temporary-password"
@@ -39,4 +41,3 @@ codex_npm_package = "@openai/codex"
 clean_apt_cache = true
 disable_apt_daily = false
 disable_zram_writeback = false
-
