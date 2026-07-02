@@ -17,8 +17,8 @@ This repository is public. Do not commit Wi-Fi credentials, initial passwords, p
 Create a local config from the example:
 
 ```bash
-cp examples/agent.local.example.toml ./rubick.local.toml
-chmod 600 ./rubick.local.toml
+cp examples/agent.local.example.toml ./agent.local.toml
+chmod 600 ./agent.local.toml
 ```
 
 Edit the local file with the agent name, temporary password, Wi-Fi SSID, Wi-Fi PSK, and drive guardrails.
@@ -35,7 +35,7 @@ Create the boot drive:
 ```bash
 ./bin/create-agent-boot-drive \
   --destination /dev/disk/by-id/usb-SanDisk_Cruzer_Blade_00000000000000000000-0:0 \
-  --config ./rubick.local.toml \
+  --config ./agent.local.toml \
   --yes
 ```
 
@@ -46,7 +46,7 @@ If the image write and byte-compare already succeeded but customization needs to
 ```bash
 ./bin/create-agent-boot-drive \
   --destination /dev/disk/by-id/usb-SanDisk_Cruzer_Blade_00000000000000000000-0:0 \
-  --config ./rubick.local.toml \
+  --config ./agent.local.toml \
   --customize-existing \
   --yes
 ```
@@ -61,7 +61,7 @@ After the USB is written:
 4. SSH in from the same LAN:
 
 ```bash
-ssh rubick@rubick.local
+ssh codex@codex-agent.local
 ```
 
 5. Inspect setup health:
