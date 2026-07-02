@@ -21,7 +21,7 @@ cp examples/agent.local.example.toml ./agent.local.toml
 chmod 600 ./agent.local.toml
 ```
 
-Edit the local file with the agent name, temporary password, Wi-Fi SSID, Wi-Fi PSK, and drive guardrails.
+Edit the local file with the agent name, local user, temporary password, Wi-Fi SSID, Wi-Fi PSK, and drive guardrails. The agent `name` is the durable agent identity and generated `.local` hostname; `user` is the Unix account used for SSH. Existing deployments often use the same value for both, but the fields are intentionally separate.
 
 List candidate drives:
 
@@ -61,7 +61,7 @@ After the USB is written:
 4. SSH in from the same LAN:
 
 ```bash
-ssh codex@codex-agent.local
+ssh my-user@my-agent.local
 ```
 
 5. Inspect setup health:

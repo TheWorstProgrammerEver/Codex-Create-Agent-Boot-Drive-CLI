@@ -2,8 +2,10 @@
 # Keep the copied file local and mode 0600. It contains secrets.
 
 [agent]
-name = "codex-agent"
-user = "codex"
+# Durable agent identity and generated .local hostname.
+name = "my-agent"
+# Local Unix account used for SSH and first-boot setup.
+user = "my-user"
 
 [user]
 initial_password = "replace-with-a-temporary-password"
