@@ -6,6 +6,7 @@ The first boot has one unavoidable manual step: a human must run `codex login --
 
 These run in `codex-agent-setup.service` before Codex auth:
 
+- `node --version`, `npm --version`, and `npx --version` work from the systemd-launched setup context.
 - `codex --version` works.
 - `~/.codex/config.toml` exists for the generated agent user.
 - Codex config contains:
@@ -14,8 +15,6 @@ These run in `codex-agent-setup.service` before Codex auth:
   - `web_search = "live"`
   - trusted project entry for the agent home directory
 - Bootstrap skills are installed:
-  - `agent-bootstrap-yolo-permissions`
-  - `agent-bootstrap-ssh`
   - `manage-durable-notes`
 - Passwordless sudo works for the generated agent user.
 - SSH is active.
@@ -41,4 +40,3 @@ codex exec --skip-git-repo-check 'Reply with OK if Codex auth is working.'
 ```
 
 This is intentionally not part of first boot because auth cannot be completed unattended.
-

@@ -60,6 +60,10 @@ class FirstBootConfig:
     ssh_password_auth: bool
     enable_tty_autologin: bool
     auto_run_setup: bool
+    node_dist_index_url: str
+    node_dist_base_url: str
+    node_lts_line: str
+    node_lts_prefix: str
     codex_npm_package: str
     clean_apt_cache: bool
     disable_apt_daily: bool
@@ -127,6 +131,20 @@ def optional_string(values: dict[str, Any], key: str, default: str) -> str:
     return value
 
 
+def optional_node_lts_line(values: dict[str, Any]) -> str:
+    node_version = optional_string(values, "node_version", "lts").strip().lower()
+    legacy_lts_line = optional_string(values, "node_lts_line", "").strip()
+    if "node_version" in values and "node_lts_line" in values:
+        raise BootDriveError("Use only one of first_boot.node_version or first_boot.node_lts_line")
+    if legacy_lts_line:
+        node_version = legacy_lts_line
+    if node_version in ("", "lts"):
+        return ""
+    if not re.fullmatch(r"[1-9][0-9]*", node_version):
+        raise BootDriveError('first_boot.node_version must be "lts" or a Node.js major version such as "24"')
+    return node_version
+
+
 def optional_bool(values: dict[str, Any], key: str, default: bool) -> bool:
     value = values.get(key, default)
     if not isinstance(value, bool):
@@ -188,6 +206,10 @@ def load_config(path: Path) -> AgentConfig:
             ssh_password_auth=optional_bool(first_boot, "ssh_password_auth", True),
             enable_tty_autologin=optional_bool(first_boot, "enable_tty_autologin", True),
             auto_run_setup=optional_bool(first_boot, "auto_run_setup", True),
+            node_dist_index_url=optional_string(first_boot, "node_dist_index_url", "https://nodejs.org/dist/index.json"),
+            node_dist_base_url=optional_string(first_boot, "node_dist_base_url", "https://nodejs.org/dist"),
+            node_lts_line=optional_node_lts_line(first_boot),
+            node_lts_prefix=optional_string(first_boot, "node_lts_prefix", "/opt/node-lts"),
             codex_npm_package=optional_string(first_boot, "codex_npm_package", "@openai/codex"),
             clean_apt_cache=optional_bool(first_boot, "clean_apt_cache", True),
             disable_apt_daily=optional_bool(first_boot, "disable_apt_daily", False),
@@ -404,6 +426,10 @@ def render_codex_agent_env(config: AgentConfig) -> str:
         "SETUP_DIR": "/opt/codex-agent-setup",
         "SKILLS_REPO_URL": repos.skills_repo_url,
         "SKILLS_REF": repos.skills_ref,
+        "NODE_DIST_INDEX_URL": fb.node_dist_index_url,
+        "NODE_DIST_BASE_URL": fb.node_dist_base_url,
+        "NODE_LTS_LINE": fb.node_lts_line,
+        "NODE_LTS_PREFIX": fb.node_lts_prefix,
         "CODEX_NPM_PACKAGE": fb.codex_npm_package,
         "CLEAN_APT_CACHE": bool01(fb.clean_apt_cache),
         "DISABLE_APT_DAILY": bool01(fb.disable_apt_daily),
@@ -651,6 +677,10 @@ setup_ref="${SETUP_REF:-main}"
 setup_dir="${SETUP_DIR:-/opt/codex-agent-setup}"
 skills_repo_url="${SKILLS_REPO_URL:-https://github.com/TheWorstProgrammerEver/codex-skills.git}"
 skills_ref="${SKILLS_REF:-main}"
+node_dist_index_url="${NODE_DIST_INDEX_URL:-https://nodejs.org/dist/index.json}"
+node_dist_base_url="${NODE_DIST_BASE_URL:-https://nodejs.org/dist}"
+node_lts_line="${NODE_LTS_LINE:-}"
+node_lts_prefix="${NODE_LTS_PREFIX:-/opt/node-lts}"
 codex_npm_package="${CODEX_NPM_PACKAGE:-@openai/codex}"
 clean_apt_cache="${CLEAN_APT_CACHE:-1}"
 disable_apt_daily="${DISABLE_APT_DAILY:-0}"
@@ -666,8 +696,6 @@ export DEBIAN_FRONTEND=noninteractive
 
 packages=(
   git
-  nodejs
-  npm
   python3
   sudo
   openssh-server
@@ -691,8 +719,6 @@ if [[ "$disable_zram_writeback" == "1" ]]; then
   systemctl disable --now rpi-zram-writeback.timer || true
 fi
 
-npm install -g "$codex_npm_package"
-
 if [[ -d "$setup_dir/.git" ]]; then
   git -C "$setup_dir" fetch --prune origin
   git -C "$setup_dir" checkout "$setup_ref"
@@ -709,58 +735,29 @@ else
 fi
 chown -R "$agent_user:$agent_user" "$setup_dir"
 
-user_setup="$(mktemp)"
-cat >"$user_setup" <<'USER_SETUP'
-#!/usr/bin/env bash
-set -euo pipefail
-
-skills_dir="${AGENT_BOOTSTRAP_SKILLS_DIR:-$HOME/agent-bootstrap-skills}"
-target="${SKILLS_INSTALL_TARGET:-$HOME/.codex/skills}"
-
-if [[ -d "$skills_dir/.git" ]]; then
-  git -C "$skills_dir" fetch --prune origin
-elif [[ -e "$skills_dir" ]]; then
-  printf 'Refusing to replace existing non-git skills path: %s\n' "$skills_dir" >&2
-  exit 1
-else
-  git clone "$SKILLS_REPO_URL" "$skills_dir"
+disable_password_auth=0
+if [[ "${SSH_PASSWORD_AUTH:-yes}" == "no" ]]; then
+  disable_password_auth=1
 fi
-
-if [[ -n "${SKILLS_REF:-}" ]]; then
-  git -C "$skills_dir" checkout "$SKILLS_REF"
-else
-  git -C "$skills_dir" checkout main
-  git -C "$skills_dir" pull --ff-only origin main
-fi
-
-npm --prefix "$skills_dir" run install:skills -- --target "$target" \
-  agent-bootstrap-yolo-permissions \
-  agent-bootstrap-ssh \
-  manage-durable-notes
-USER_SETUP
-chmod 0755 "$user_setup"
 
 runuser -u "$agent_user" -- env \
+  HOME="$home_dir" \
+  AGENT_NAME="$agent_name" \
+  AGENT_HOSTNAME="$agent_name" \
+  AGENT_USER="$agent_user" \
+  DISABLE_PASSWORD_AUTH="$disable_password_auth" \
+  ENABLE_PASSWORDLESS_SUDO=1 \
+  SKIP_CODEX_LOGIN=1 \
+  RUN_CODEX_BOOTSTRAP=1 \
+  CODEX_WORKSPACE="$home_dir" \
   SKILLS_REPO_URL="$skills_repo_url" \
   SKILLS_REF="$skills_ref" \
-  AGENT_BOOTSTRAP_SKILLS_DIR="$home_dir/agent-bootstrap-skills" \
-  SKILLS_INSTALL_TARGET="$home_dir/.codex/skills" \
-  bash "$user_setup"
-rm -f "$user_setup"
-
-runuser -u "$agent_user" -- python3 "$home_dir/.codex/skills/manage-durable-notes/scripts/init_durable_notes.py" --home "$home_dir"
-runuser -u "$agent_user" -- python3 "$home_dir/.codex/skills/agent-bootstrap-yolo-permissions/scripts/bootstrap_yolo_permissions.py" \
-  --home "$home_dir" \
-  --workspace "$home_dir" \
-  --dedicated-host \
-  --enable-passwordless-sudo \
-  --yes
-runuser -u "$agent_user" -- python3 "$home_dir/.codex/skills/agent-bootstrap-ssh/scripts/bootstrap_ssh.py" \
-  --user "$agent_user" \
-  --home "$home_dir" \
-  --enable-password-auth \
-  --enable-passwordless-sudo \
-  --yes
+  CODEX_NPM_PACKAGE="$codex_npm_package" \
+  NODE_DIST_INDEX_URL="$node_dist_index_url" \
+  NODE_DIST_BASE_URL="$node_dist_base_url" \
+  NODE_LTS_LINE="$node_lts_line" \
+  NODE_LTS_PREFIX="$node_lts_prefix" \
+  "$setup_dir/agent-setup.sh"
 
 if [[ "$clean_apt_cache" == "1" ]]; then
   apt-get clean
@@ -807,13 +804,14 @@ check_sshd() {
   echo "agent_user=$agent_user"
 
   check "codex-version" codex --version
+  check "node-version" node --version
+  check "npm-version" npm --version
+  check "npx-version" npx --version
   check "ssh-active" systemctl is-active --quiet ssh.service
   check "avahi-active" systemctl is-active --quiet avahi-daemon.service
   check_agent "passwordless-sudo" sudo -n true
   check "remote-access-note" test -f "$home_dir/REMOTE_ACCESS.md"
   check "durable-notes-index" test -f "$home_dir/codex-notes/INDEX.md"
-  check "yolo-skill-installed" test -f "$home_dir/.codex/skills/agent-bootstrap-yolo-permissions/SKILL.md"
-  check "ssh-skill-installed" test -f "$home_dir/.codex/skills/agent-bootstrap-ssh/SKILL.md"
   check "notes-skill-installed" test -f "$home_dir/.codex/skills/manage-durable-notes/SKILL.md"
   check "codex-config-exists" test -f "$home_dir/.codex/config.toml"
   check "codex-config-sandbox" grep -q '^sandbox_mode = "danger-full-access"' "$home_dir/.codex/config.toml"
