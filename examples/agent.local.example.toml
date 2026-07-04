@@ -37,6 +37,11 @@ skills_ref = "main"
 ssh_password_auth = true
 enable_tty_autologin = true
 auto_run_setup = true
+node_dist_index_url = "https://nodejs.org/dist/index.json"
+node_dist_base_url = "https://nodejs.org/dist"
+# Leave empty to track the latest official LTS line. Set to a major version, such as 24, only for a deliberate pin.
+node_lts_line = ""
+node_lts_prefix = "/opt/node-lts"
 codex_npm_package = "@openai/codex"
 clean_apt_cache = true
 disable_apt_daily = false

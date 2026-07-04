@@ -9,6 +9,7 @@ This repository is public. Do not commit Wi-Fi credentials, initial passwords, p
 - Raspberry Pi OS Lite ARM64 Trixie
 - Raspberry Pi 5 booting from USB storage
 - First access over SSH password auth
+- Latest official Node.js LTS installed system-wide for interactive shells and first-boot/systemd setup tasks
 - Codex auth remains a manual human step with `codex login --device-auth`
 - Codex YOLO defaults are written before auth, so the next Codex session starts with local full access
 
@@ -87,3 +88,11 @@ codex-attach
 ## Post-Setup Assertions
 
 The generated image runs pre-auth assertions automatically. See [docs/post-setup-assertions.md](docs/post-setup-assertions.md).
+
+## Node.js Runtime
+
+First boot resolves Node.js from the official distribution index at `https://nodejs.org/dist/index.json` and selects the latest release with an LTS marker. Current releases are ignored until Node.js promotes them to LTS. As of 2026-07-04, that means Node 24 LTS is selected instead of Node 26 Current.
+
+The generated first-boot service clones `Codex-Agent-Setup` and runs its `agent-setup.sh` entrypoint. That setup installs the verified Node.js binary tarball under `/opt/node-lts`, then symlinks `node`, `npm`, `npx`, and `corepack` into `/usr/local/bin`. Debian stable's `nodejs` package can lag behind modern Vite, Vitest, and Supabase tooling, so the boot-drive setup does not use it as the app-work runtime.
+
+Leave `first_boot.node_lts_line` empty to maintain the latest LTS line on rerun. Set it to a major version such as `24` only when deliberately pinning, and remove the pin to resume latest-LTS tracking.
