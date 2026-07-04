@@ -131,6 +131,20 @@ def optional_string(values: dict[str, Any], key: str, default: str) -> str:
     return value
 
 
+def optional_node_lts_line(values: dict[str, Any]) -> str:
+    node_version = optional_string(values, "node_version", "lts").strip().lower()
+    legacy_lts_line = optional_string(values, "node_lts_line", "").strip()
+    if "node_version" in values and "node_lts_line" in values:
+        raise BootDriveError("Use only one of first_boot.node_version or first_boot.node_lts_line")
+    if legacy_lts_line:
+        node_version = legacy_lts_line
+    if node_version in ("", "lts"):
+        return ""
+    if not re.fullmatch(r"[1-9][0-9]*", node_version):
+        raise BootDriveError('first_boot.node_version must be "lts" or a Node.js major version such as "24"')
+    return node_version
+
+
 def optional_bool(values: dict[str, Any], key: str, default: bool) -> bool:
     value = values.get(key, default)
     if not isinstance(value, bool):
@@ -194,7 +208,7 @@ def load_config(path: Path) -> AgentConfig:
             auto_run_setup=optional_bool(first_boot, "auto_run_setup", True),
             node_dist_index_url=optional_string(first_boot, "node_dist_index_url", "https://nodejs.org/dist/index.json"),
             node_dist_base_url=optional_string(first_boot, "node_dist_base_url", "https://nodejs.org/dist"),
-            node_lts_line=optional_string(first_boot, "node_lts_line", ""),
+            node_lts_line=optional_node_lts_line(first_boot),
             node_lts_prefix=optional_string(first_boot, "node_lts_prefix", "/opt/node-lts"),
             codex_npm_package=optional_string(first_boot, "codex_npm_package", "@openai/codex"),
             clean_apt_cache=optional_bool(first_boot, "clean_apt_cache", True),

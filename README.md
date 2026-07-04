@@ -95,4 +95,4 @@ First boot resolves Node.js from the official distribution index at `https://nod
 
 The generated first-boot service clones `Codex-Agent-Setup` and runs its `agent-setup.sh` entrypoint. That setup installs the verified Node.js binary tarball under `/opt/node-lts`, then symlinks `node`, `npm`, `npx`, and `corepack` into `/usr/local/bin`. Debian stable's `nodejs` package can lag behind modern Vite, Vitest, and Supabase tooling, so the boot-drive setup does not use it as the app-work runtime.
 
-Leave `first_boot.node_lts_line` empty to maintain the latest LTS line on rerun. Set it to a major version such as `24` only when deliberately pinning, and remove the pin to resume latest-LTS tracking.
+Set `first_boot.node_version = "lts"` to maintain the latest official LTS line on rerun; this is the default when the setting is omitted. Set it to a major version string such as `"24"` only when deliberately pinning, and change it back to `"lts"` to resume latest-LTS tracking. The older `first_boot.node_lts_line` setting is still accepted as a compatibility alias for pinned major versions, but new configs should use `node_version`.
