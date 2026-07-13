@@ -89,6 +89,33 @@ codex-attach
 
 The generated image runs pre-auth assertions automatically. See [docs/post-setup-assertions.md](docs/post-setup-assertions.md).
 
+## Drive Health Low-Write Profile
+
+This boot-drive CLI prepares Raspberry Pi OS Lite USB media, but it does not
+silently install or enable the Drive Health routine runner. Use the Drive Health
+`pi-usb-flash` profile as the shared checklist for low-write choices before
+first boot and for verification after setup.
+
+Before first boot, keep image-time decisions aligned with that profile:
+
+- root filesystem atime policy;
+- journald storage and disk limits;
+- zram/zswap versus disk-backed swap posture;
+- periodic fstrim support to verify after boot;
+- package-cache cleanup after setup.
+
+After first boot and Codex auth, install or build the Drive Health CLI and run:
+
+```bash
+drive-health check --profile pi-usb-flash
+drive-health suggest --profile pi-usb-flash
+drive-health runner install --scope user --bin /usr/local/bin/drive-health --profile pi-usb-flash
+drive-health doctor --runner-scope user
+```
+
+Review the generated unit files before enabling the timer. The runner performs
+read-only `check` runs and writes bounded, redacted reports.
+
 ## Node.js Runtime
 
 First boot resolves Node.js from the official distribution index at `https://nodejs.org/dist/index.json` and selects the latest release with an LTS marker. Current releases are ignored until Node.js promotes them to LTS. As of 2026-07-04, that means Node 24 LTS is selected instead of Node 26 Current.

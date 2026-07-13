@@ -40,3 +40,17 @@ codex exec --skip-git-repo-check 'Reply with OK if Codex auth is working.'
 ```
 
 This is intentionally not part of first boot because auth cannot be completed unattended.
+
+## Drive Health Profile Check
+
+For USB flash boot media, use the Drive Health CLI after first boot to verify
+the same low-write posture that should be considered during image preparation:
+
+```bash
+drive-health check --profile pi-usb-flash
+drive-health suggest --profile pi-usb-flash
+drive-health doctor --runner-scope user
+```
+
+The routine runner should be installed and enabled only after its generated
+systemd unit files have been reviewed.
