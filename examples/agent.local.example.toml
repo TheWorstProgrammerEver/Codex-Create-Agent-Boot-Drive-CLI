@@ -43,6 +43,11 @@ node_dist_base_url = "https://nodejs.org/dist"
 node_version = "lts"
 node_lts_prefix = "/opt/node-lts"
 codex_npm_package = "@openai/codex"
+# Low-write USB flash baseline: keep setup cache cleanup on, then verify with
+# drive-health check --profile pi-usb-flash after first boot.
 clean_apt_cache = true
+# Leave apt timers enabled unless the host has a deliberate update policy.
 disable_apt_daily = false
+# Disable zram writeback only when the target image provides that timer and the
+# Drive Health low-write profile says disk writeback is not wanted.
 disable_zram_writeback = false
